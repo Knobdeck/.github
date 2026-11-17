@@ -1,0 +1,134 @@
+# Reusable plugin build for every KnobDeck plugin repo (the knobdeck-plugins monorepo, plugins split
+# out of it, third-party plugins). One call builds the given plugin folders on one OS:
+#   knobdeck-plugin build + package  ->  knobdeck-plugin conform  ->  out/ under release names
+# and uploads out/ as the artifact `bundles-<os>`:
+#   <dir>_<os>_<version>.knobdeck   the bundle
+#   <dir>_<os>_readme.md            its readme, when the bundle has one
+#   part-<os>.json                  one entry per bundle: dir, id, version, sha256, platforms, …
+# With `attest: true` the bundles get a build-provenance attestation (free on public repos); the
+# caller must grant `id-token: write` and `attestations: write`.
+#
+# Build-time app credentials come from Actions variables, repository first, then organization
+# (Settings > Secrets and variables > Actions > Variables). Unset ones leave the plugin asking for
+# its own in setup. They are public client ids, never secrets.
+#
+#   jobs:
+#     build:
+#       uses: Knobdeck/.github/.github/workflows/build-plugin.yml@main
+#       with: { os: linux, plugins: "my-plugin" }
+name: build-plugin
+on:
+  workflow_call:
+    inputs:
+      os:
+        description: "macos | windows | linux"
+        type: string
+        required: true
+      plugins:
+        description: Space-separated plugin folders, relative to the repo root ("." for a single-plugin repo)
+        type: string
+        required: true
+      runner:
+        description: Runner label; default ubuntu-22.04 (glibc 2.35, runs on Debian 12+), macos-latest, windows-latest
+        type: string
+        default: ""
+      conform:
+        description: Run `knobdeck-plugin conform` on every built plugin
+        type: boolean
+        default: true
+      attest:
+        description: Attest the bundles' build provenance (needs id-token + attestations write)
+        type: boolean
+        default: false
+      sdk-ref:
+        description: knobdeck-sdk git ref to install knobdeck-plugin from
+        type: string
+        default: master
+jobs:
+  build:
+    runs-on: ${{ inputs.runner || (inputs.os == 'linux' && 'ubuntu-22.04') || (inputs.os == 'macos' && 'macos-latest') || 'windows-latest' }}
+    steps:
+      - name: Check inputs
+        shell: bash
+        run: |
+          case "${{ inputs.os }}" in macos|windows|linux) ;; *) echo "::error::os must be macos, windows or linux"; exit 1;; esac
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        # macOS plugins ship as universal binaries (knobdeck-plugin build lipos both).
+        with:
+          targets: ${{ inputs.os == 'macos' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+      - uses: Swatinem/rust-cache@v2
+      # knobdeck-plugin packages with bsdtar; Ubuntu's tar is GNU tar, which can't write zip.
+      - name: Linux packaging tools
+        if: inputs.os == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y libarchive-tools
+      - name: Install knobdeck-plugin
+        shell: bash
+        run: cargo install --git https://github.com/Knobdeck/knobdeck-sdk --branch "${{ inputs.sdk-ref }}" --bin knobdeck-plugin --locked
+      - name: Build and package
+        shell: bash
+        env:
+          # App credentials baked in at build time (option_env! / build.rs).
+          DISCORD_CLIENT_ID: ${{ vars.DISCORD_CLIENT_ID }}
+          VOICEMOD_CLIENT_KEY: ${{ vars.VOICEMOD_CLIENT_KEY }}
+          SPOTIFY_CLIENT_ID: ${{ vars.SPOTIFY_CLIENT_ID }}
+          # No Google secret here: the registry site's token endpoint adds it server-side.
+          GOOGLE_CLIENT_ID: ${{ vars.GOOGLE_CLIENT_ID }}
+          KNOBDECK_GOOGLE_TOKEN_URL: ${{ vars.KNOBDECK_GOOGLE_TOKEN_URL }}
+          TWITCH_CLIENT_ID: ${{ vars.TWITCH_CLIENT_ID }}
+          PLUGINS: ${{ inputs.plugins }}
+        run: |
+          for d in $PLUGINS; do (cd "$d" && knobdeck-plugin build && knobdeck-plugin package); done
+      - name: Conform
+        if: inputs.conform
+        timeout-minutes: 5
+        shell: bash
+        env:
+          PLUGINS: ${{ inputs.plugins }}
+        run: for d in $PLUGINS; do (cd "$d" && knobdeck-plugin conform); done
+      - name: Stage under release names
+        shell: bash
+        env:
+          OS: ${{ inputs.os }}
+          PLUGINS: ${{ inputs.plugins }}
+        run: |
+          node --input-type=module - <<'EOF'
+          import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+          import { createHash } from "node:crypto";
+          import { basename, join, resolve } from "node:path";
+          const os = process.env.OS;
+          mkdirSync("out", { recursive: true });
+          const entries = [];
+          for (const dir of process.env.PLUGINS.split(/\s+/).filter(Boolean)) {
+            // A single-plugin repo builds "."; its release names use the repo folder's name.
+            const name = dir === "." ? basename(resolve(".")) : dir;
+            const dist = join(dir, "dist");
+            const bundle = readdirSync(dist).find((f) => f.endsWith(".knobdeck"));
+            if (!bundle) throw new Error(`${dir}: no .knobdeck in dist/`);
+            const unpacked = join(dist, bundle.replace(/\.knobdeck$/, ""));
+            const m = JSON.parse(readFileSync(join(unpacked, "manifest.json"), "utf8"));
+            if (!m.platforms?.includes(os)) throw new Error(`${m.id}: manifest platforms must include ${os}`);
+            const file = `${name}_${os}_${m.version}.knobdeck`;
+            copyFileSync(join(dist, bundle), join("out", file));
+            let readmeFile = null;
+            if (existsSync(join(unpacked, "readme.md"))) {
+              readmeFile = `${name}_${os}_readme.md`;
+              copyFileSync(join(unpacked, "readme.md"), join("out", readmeFile));
+            }
+            const bytes = readFileSync(join("out", file));
+            entries.push({
+              dir: name, id: m.id, version: m.version, description: m.description ?? "", author: m.author ?? null,
+              icon: m.icon ?? null, platforms: m.platforms, uses: m.uses ?? [], file, readmeFile,
+              sha256: createHash("sha256").update(bytes).digest("hex"), size: statSync(join("out", file)).size,
+            });
+            console.log(`${m.id} ${m.version} -> ${file}`);
+          }
+          writeFileSync(`out/part-${os}.json`, JSON.stringify(entries, null, 2));
+          EOF
+      - name: Attest build provenance
+        if: inputs.attest
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: out/*.knobdeck
+      - uses: actions/upload-artifact@v4
+        with: { name: "bundles-${{ inputs.os }}", path: "out/*" }
