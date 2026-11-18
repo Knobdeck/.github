@@ -76,6 +76,7 @@ jobs:
           GOOGLE_CLIENT_ID: ${{ vars.GOOGLE_CLIENT_ID }}
           KNOBDECK_GOOGLE_TOKEN_URL: ${{ vars.KNOBDECK_GOOGLE_TOKEN_URL }}
           TWITCH_CLIENT_ID: ${{ vars.TWITCH_CLIENT_ID }}
+          GITHUB_CLIENT_ID: ${{ vars.GITHUB_CLIENT_ID }}
           PLUGINS: ${{ inputs.plugins }}
         run: |
           for d in $PLUGINS; do (cd "$d" && knobdeck-plugin build && knobdeck-plugin package); done
